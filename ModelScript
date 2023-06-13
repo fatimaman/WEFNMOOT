@@ -1,0 +1,1515 @@
+filepath = input('Enter file path name for Excel data file:')
+respath = input('Enter file path to where to store results Excel file:')
+
+
+import pandas as pd
+from gekko import GEKKO
+import numpy as np
+import matplotlib.pyplot as plt
+import xlsxwriter
+
+m = GEKKO(remote=False)
+
+
+#Define food class and related parameters
+class FoodItem():
+    def __init__(self,num,name,source,group,watercontent,energycontent,proteincontent,
+                 processwater,processenergy,lossratio,wasteratio,prioritylevel,
+                currentcons,allowabledietchange,convfactor,cprod,cimp,cexp):
+        self.num=num
+        self.name=name
+        self.source=source
+        self.group=group
+        self.watercontent=watercontent #g water/100 g food
+        self.energycontent=energycontent #kcal/100 g food
+        self.proteincontent=proteincontent #g protein/100 g food
+        self.processwater=processwater #m3/ton
+        self.processenergy=processenergy #kWh/ton
+        self.lossratio=lossratio
+        self.wasteratio=wasteratio
+        self.prioritylevel=prioritylevel
+        self.currentcons=currentcons #g/dday/capita
+        self.allowabledietchange=allowabledietchange #percentage
+        self.convfactor=convfactor #ton/ton
+        self.cprod=cprod #$/ton
+        self.cimp=cimp #$/ton
+        self.cexp=cexp #$/ton
+
+#Import food data from input excel sheet and convert to list
+dfood = pd.read_excel(filepath, sheet_name='FoodItems') 
+fooditems = dfood.values.tolist()
+#print(fooditems)
+
+#Populate food class from list
+fooditem_instances = []
+for i in fooditems:
+    fooditem_instances.append(FoodItem(*i))
+    
+#Initialize and populate indivdual food parameter arrays
+food_names=[]
+food_source=[]
+food_groups=[]
+food_water=[]
+food_energy=[]
+food_loss=[]
+food_waste=[]
+food_priority=[]
+food_change=[]
+food_currentcons=[]
+food_cprod=[]
+food_cimp=[]
+food_cexp=[]
+
+for i in fooditem_instances:
+    food_names.append(i.name)
+    food_source.append(i.source)
+    food_groups.append(i.group)
+    food_water.append(i.processwater)
+    food_energy.append(i.processenergy)
+    food_loss.append(i.lossratio)
+    food_waste.append(i.wasteratio)
+    food_priority.append(i.prioritylevel)
+    food_change.append(i.allowabledietchange)
+    food_currentcons.append(i.currentcons)
+    food_cprod.append(i.cprod)
+    food_cimp.append(i.cimp)
+    food_cexp.append(i.cexp)
+
+#Differentiate between food items from crops and livestock (for later conversion)
+foodfromcrops = [i for i in fooditem_instances if i.source =='Agriculture' and i.source!='Water']
+foodfromlivestock = [i for i in fooditem_instances if i.source =='Livestock'and i.source!='Water']
+
+#Define array of food item variables: production, import, export, demand, cons of food i,j
+foodvars = m.Array(m.Var,(len(fooditem_instances),5), lb=0)
+
+#Populate array of food data parameters
+ccfood=[]
+for i in range(len(fooditem_instances)):
+    ccfood+=[(food_names[i], food_groups[i], foodvars[i][4], food_water[i], food_energy[i],
+             food_loss[i], food_waste[i], food_priority[i], food_change[i], food_currentcons[i],
+              food_source[i],food_cprod[i],food_cimp[i],food_cexp[i],foodvars[i][0])]
+        
+#Differentiate between food items from crops and livestock 
+cclivfood=[]
+ccagrifood=[]
+totalagrifood=0
+
+for i in range(len(ccfood)):
+    #print(ccfood[i][0],ccfood[i][2], foodvars[i][0])
+    if ccfood[i][10] == 'Livestock':
+        cclivfood += [(ccfood[i][0],ccfood[i][2],ccfood[i][14])] #name, consumption, production
+    if ccfood[i][10] == 'Agriculture':
+        ccagrifood += [(ccfood[i][0],ccfood[i][2],ccfood[i][14])]
+        
+for i in range(len(ccagrifood)):        
+    totalagrifood += ccagrifood[i][2]
+
+#Initialize values: population, total water for food, total energy for food
+dinfo = pd.read_excel(filepath, sheet_name='GenInfo') 
+info = dinfo['Data Value'].tolist()
+
+pop= info[0]
+
+tfwr=0
+tfer=0
+
+totalfoodprod=0
+totalfoodimp=0
+totalfooddem=0
+totalfoodexp=0
+totalfoodcost=0
+totalfoodimpcost=0
+totalfoodexpcost=0
+
+for i in range(len(foodvars)):
+
+    #Calculate demand of food i,j in ton/yr from consumption in g/d/capita
+    #EQUATION (9) from Mortada et al (2018)
+    m.Equation(foodvars[i][3]*(10**6*(1-ccfood[i][5])*(1-ccfood[i][6]))==(foodvars[i][4]*pop*365.25))
+    
+    #Food balance of production+import-export=demand in ton/yr
+    #EQUATION (10) from Mortada et al (2018)
+    m.Equation(foodvars[i][0]+foodvars[i][1]-foodvars[i][2]==foodvars[i][3])
+
+    m.Equation(foodvars[i][2]==0)
+    #Calculate total water and energy consumption for food processing
+    tfwr+=ccfood[i][3]*foodvars[i][0]
+    
+    tfer+=ccfood[i][4]*foodvars[i][0]
+
+    totalfoodprod+=foodvars[i][0]
+    totalfoodimp+=foodvars[i][1]
+    totalfooddem+=foodvars[i][3]
+    totalfoodexp+=foodvars[i][2]
+    
+    totalfoodcost+=ccfood[i][11]*foodvars[i][0]
+    totalfoodimpcost+=ccfood[i][12]*foodvars[i][1]
+    totalfoodexpcost+=ccfood[i][13]*foodvars[i][2]
+
+m.Equation(totalfoodprod/(totalfoodprod+totalfoodimp-totalfoodexp)>=0.5)
+
+#Define functions to calculate nutrient (water, energy, protein) content in food ij
+def watercontent(i,j):
+    return foodvars[j][4]*(i.watercontent/100)
+def energycontent(i,j):
+    return foodvars[j][4]*(i.energycontent/100)
+def proteincontent(i,j):
+    return foodvars[j][4]*(i.proteincontent/100)
+
+#Initialize and calculate total nutrient values
+totalwater=0
+totalenergy=0
+totalprotein=0
+
+j=0
+for i in fooditem_instances:
+    totalwater+=watercontent(i,j)
+    totalenergy+=energycontent(i,j)
+    totalprotein+=proteincontent(i,j)
+    j+=1
+
+#Specify lower and upper nutritional limits
+totalnutrient = [totalenergy, totalprotein]
+
+dnutlimits=pd.read_excel(filepath, sheet_name='NutrientLimits') 
+
+nutrientupperlimit = dnutlimits['Upper limit'].tolist()
+nutrientlowerlimit = dnutlimits['Lower limit'].tolist()
+
+numnutrients = len(totalnutrient)
+
+#Nutritional intake limit constraints
+#EQUATION (5) in Mortada et al (2018)
+for i in range(numnutrients):
+    m.Equation(nutrientlowerlimit[i] <= totalnutrient[i])
+    m.Equation(totalnutrient[i] <= nutrientupperlimit[i])
+
+#Define food group consumption array
+fgcons = []
+
+#Filter out unique food groups
+numfg = len(list(set(food_groups)))
+
+#Initialize and populate food group consumption array
+for i in range(numfg):
+    fgcons.append(0)
+
+for i in range(len(ccfood)):
+    if ccfood[i][1] == 'Cereals':
+        fgcons[0] += ccfood[i][2] #whole grains
+    if ccfood[i][1] == 'Roots':
+        fgcons[1] += ccfood[i][2] #tuber/starchy vegetables
+    if ccfood[i][1] == 'Vegetables':
+        fgcons[2] += ccfood[i][2] #vegetables
+    if ccfood[i][1] == 'Fruits':
+        fgcons[3] += ccfood[i][2] #fruits
+    if ccfood[i][1] == 'Dairy':
+        fgcons[4] += ccfood[i][2] #dairy
+    if ccfood[i][1] == 'Protein':
+        fgcons[5] += ccfood[i][2] #protein
+    if ccfood[i][1] == 'Legumes':
+        fgcons[6] += ccfood[i][2] #legumes
+    if ccfood[i][1] == 'Added fats':
+        fgcons[7] += ccfood[i][2] #added fats
+    if ccfood[i][1] == 'Added sugars':
+        fgcons[8] += ccfood[i][2] #added sugars
+
+#Specify food group intake ranges based on reference diet from Willet et al. (2019)
+dfglimits = pd.read_excel(filepath, sheet_name='DietaryLimits') 
+
+fgminintake = dfglimits['Minimal intake'].tolist()
+fgmaxintake = dfglimits['Maximal intake'].tolist()
+
+numgroups=len(fgcons)
+
+#Food group intake constraints
+#EQUATION (6) in Mortada et al (2018)
+for i in range(numgroups):
+    m.Equation(fgminintake[i] <= fgcons[i])
+    m.Equation(fgcons[i] <= fgmaxintake[i])
+    
+    
+#Define crop class and related parameters
+class Crop():
+    def __init__(self,num,name,group,climate,district,soil,
+                irrtech,irreff,actyield,potyield,bluewater,greenwater,
+                greywater,energyreq,NDEP,BNF,NSF,Ncontent,Ndemand):
+        self.num=num
+        self.name=name
+        self.group=group
+        self.climate=climate
+        self.district=district
+        self.soil=soil
+        self.irrtech=irrtech
+        self.irreff=irreff
+        self.actyield=actyield
+        self.potyield=potyield
+        self.bluewater=bluewater
+        self.greenwater=greenwater
+        self.greywater=greywater
+        self.energyreq=energyreq
+        self.NDEP=NDEP
+        self.BNF=BNF
+        self.NSF=NSF
+        self.Ncontent=Ncontent
+        self.Ndemand=Ndemand
+
+#Import crop data from input excel sheet and convert to list
+dcrops = pd.read_excel(filepath, sheet_name='Crops') 
+crops = dcrops.values.tolist()
+
+#Populate crop class from list
+crop_instances = []
+for i in crops:
+    crop_instances.append(Crop(*i))
+
+#Define array of crop production variables for each set of mndrsq, [ton/yr]
+cropprodvars = m.Array(m.Var,(len(crop_instances),1), lb=0)
+
+#Define array of manure/fertilizer variables: production, import, export, demand of manure/fertilizer
+manureAdd = m.Array(m.Var,(len(crop_instances),1), lb=0) #nitrogen input in kgN/ha
+NfertAdd = m.Array(m.Var,(len(crop_instances),1), lb=0) #nitrogen input in kgN/ha
+
+#Initialize and populate indivdual crop parameter arrays
+crops_name=[]
+crops_group=[]
+crops_climate=[]
+crops_district=[]
+crops_soil=[]
+crops_irrtech=[]
+crops_yield=[]
+crops_water=[]
+crops_energy=[]
+crops_Nitrogen=[]
+
+for i in crop_instances:
+    crops_name.append(i.name)
+    crops_group.append(i.group)
+    crops_climate.append(i.climate)
+    crops_district.append(i.district)
+    crops_soil.append(i.soil)
+    crops_irrtech.append(i.irrtech)
+    crops_yield.append((i.actyield, i.potyield)) #ton/ha
+    crops_water.append((i.bluewater/i.irreff, i.greenwater)) #m3/ton
+    crops_energy.append(i.energyreq) #kWh/ton
+    crops_Nitrogen.append((i.NDEP, i.BNF, i.NSF, i.Ncontent, i.Ndemand)) #kgN/ha, gN/100g,
+
+#Separate fodder crops
+fodder = [i for i in crop_instances if i.group == 'Fodder' ]
+
+#Populate array of all crop data parameters
+cccrops=[]
+for i in range(len(crop_instances)):
+    cccrops +=[(crops_name[i], crops_group[i], crops_climate[i], crops_district[i], crops_soil[i],
+               crops_irrtech[i], cropprodvars[i][0], manureAdd[i][0], NfertAdd[i][0], crops_yield[i][0], crops_water[i], 
+               crops_energy[i], (cropprodvars[i][0]/crops_yield[i][1]), crops_Nitrogen[i])]
+
+#Initialize, populate, and calculate production amounts of each crop across all conditions
+totalcropprod=[]
+
+for i in range(len(set(crops_name))):
+    totalcropprod.append(0)
+
+for i in range(len(cccrops)):
+    if cccrops[i][0] == 'Wheat':
+        totalcropprod[0] += cccrops[i][6]
+    if cccrops[i][0] == 'Maize':
+        totalcropprod[1] += cccrops[i][6]
+    if cccrops[i][0] == 'Potatoes':
+        totalcropprod[2] += cccrops[i][6]
+    if cccrops[i][0] == 'Beans':
+        totalcropprod[3] += cccrops[i][6]
+    if cccrops[i][0] == 'Olives':
+        totalcropprod[4] += cccrops[i][6]
+    if cccrops[i][0] == 'Tomatoes':
+        totalcropprod[5] += cccrops[i][6]
+    if cccrops[i][0] == 'Peas':
+        totalcropprod[6] += cccrops[i][6]
+    if cccrops[i][0] == 'Oranges':
+        totalcropprod[7] += cccrops[i][6]
+    if cccrops[i][0] == 'Bananas':
+        totalcropprod[8] += cccrops[i][6]
+    if cccrops[i][0] == 'Alfalfa':
+        totalcropprod[9] += cccrops[i][6]
+    if cccrops[i][0] == 'Grasses':
+        totalcropprod[10] += cccrops[i][6]
+        
+#Initialize and populate values and arrays for nitrogen and resource consumption
+totalenergyforcrops=0
+totalbluewater=0
+totalgreenwater=0
+totalcropland=0
+
+NcropsNat = []
+NcropsNatTotal = []
+NcropsAdded = []
+NcropsAddedTotal = []
+NcropsOut = []
+NcropsOutTotal = []
+NcropsLoss = []
+NcropsLossTotal = []
+Ndiff = []
+a=[]
+
+
+for i in range(len(cccrops)):
+    NcropsNat.append(0)
+    NcropsNatTotal.append(0)
+    NcropsAdded.append(0)
+    NcropsAddedTotal.append(0)
+    NcropsOut.append(0)
+    NcropsOutTotal.append(0)
+    NcropsLoss.append(0)
+    NcropsLossTotal.append(0)
+    Ndiff.append(0)
+    a.append(0)
+
+
+for i in range(len(cccrops)):
+    a[i] = m.if3(-cccrops[i][6],1,0)
+
+for i in range(len(cccrops)):
+    #Calculate total energy requirements for crops 
+    totalenergyforcrops += cccrops[i][6] * cccrops[i][11]
+    
+    #Calculate total blue and green water requirements
+    totalbluewater += cccrops[i][6] * cccrops[i][10][0]
+    totalgreenwater += cccrops[i][6] * cccrops[i][10][1]
+    
+    #EQUATION (18) from Mortada et al (2018)
+    totalcropland += cccrops[i][12]
+    
+    #EQUATION (7) from Khattar et al (2022)
+    NcropsNat[i] = (cccrops[i][13][0] + cccrops[i][13][1] + cccrops[i][13][2]) #kgN/ha
+    NcropsNatTotal[i] = cccrops[i][12] * (cccrops[i][13][0] + cccrops[i][13][1] + cccrops[i][13][2]) #kgN
+    
+    #EQUATION (8) from Khattar et al (2022)
+    NcropsAdded[i] = (cccrops[i][7] + cccrops[i][8]) #kgN/ha
+    
+    NcropsAddedTotal[i] =(cccrops[i][7] + cccrops[i][8])*cccrops[i][12] #kgN
+    
+    #EQUATION (d) Khattar et al (2022) supplementary material
+    NcropsOutTotal[i] =(cccrops[i][6] * cccrops[i][13][3] * 10000) #kgN 10000 g food* kg N/1 g food
+    
+    #EQUATIONs from Khattar et al Excel
+    NcropsLoss[i] = (0.006*cccrops[i][7] + 0.01*cccrops[i][8]) + (0.1*cccrops[i][7] + 0.150*cccrops[i][8]) + (0.3*cccrops[i][7] + 0.3*cccrops[i][8]) #NGAS, NVOL, NLEACH kgN/ha
+
+    NcropsLossTotal[i] = cccrops[i][12] * ((0.006*cccrops[i][7] + 0.01*cccrops[i][8]) + (0.1*cccrops[i][7] + 0.150*cccrops[i][8]) + (0.3*cccrops[i][7] + 0.3*cccrops[i][8])) #NGAS, NVOL, NLEACH kgN
+    
+    m.Equation((NcropsAdded[i] - NcropsLoss[i] - cccrops[i][13][4])==0)
+    m.Minimize(1e-4*(1-a[i])*(NcropsAdded[i] - NcropsLoss[i] - cccrops[i][13][4])**2)
+
+#Part of EQUATION (30) from Chamas et al (2021)
+#Calculate nitrogen use efficiency
+#EQUATION (4) from Khattar et al (2022)
+totalNINPUT = sum(NcropsAddedTotal) + sum(NcropsNatTotal) 
+#EQUATION (3) from Khattar et al (2022)
+totalNOUTPUT = sum(NcropsOutTotal) 
+#EQUATION (2) from Khattar et al (2022)
+NUE = totalNOUTPUT/totalNINPUT
+NDiff = totalNINPUT - totalNOUTPUT
+    
+#Calculate total amount of added manure and fertilizer
+totalmanure=0
+totalfert=0
+
+for i in range(len(NfertAdd)):
+    totalmanure += manureAdd[i][0]*cccrops[i][12]
+    totalfert += NfertAdd[i][0]*cccrops[i][12]
+
+#Define manure/fertilizer variables: production, import, export, demand
+manurevars = m.Array(m.Var, (1,4),lb=0)
+fertvars = m.Array(m.Var, (1,4),lb=0)
+
+#Equate demand for fertilizer/manure with amount that needs to be added
+m.Equation(fertvars[0][3] == totalfert)
+m.Equation(totalmanure == manurevars[0][3])
+#m.Equation(manurevars[0][1] == 0)
+#m.Equation(fertvars[0][1] == 0)
+#m.Equation(fertvars[0][2] == 0)
+#m.Equation(manurevars[0][2] == 0)
+
+
+#Balance of fertilizer and manure variables: production+import-export=demand in kgN/year
+m.Equation(fertvars[0][0] + fertvars[0][1] - fertvars[0][2] == fertvars[0][3])
+m.Equation(manurevars[0][0] + manurevars[0][1] - manurevars[0][2] == manurevars[0][3])
+
+#Calculate emissions from fertilizer production
+cropManFertEmisssions = fertvars[0][0]*0.01*(44/28)*265 #kg
+
+#Calculate water and energy requirements for fertilizer production
+fertenergy = 173 * fertvars[0][0] #173 kWh/ton
+fertwater = 12.8 * fertvars[0][0] #12.8 m3/ton
+
+#Define crop variables: production, import, export, demand for crop mn, [ton/yr]
+cropvars = m.Array(m.Var, (len(set(crops_name)),4), lb=0)
+
+totalcropDEM=0
+totalcropPROD=0
+totalcropIMP=0
+totalcropEXP=0
+
+for i in range(len(cropvars)):
+    #Equating total crop production
+    #EQUATION (14) from Mortada et al (2018)
+    m.Equation(totalcropprod[i] == cropvars[i][0])
+    
+    #Balance of crop variables: production+import-export=demand in ton/year
+    #EQUATION (13) from Mortada et al (2018)
+    m.Equation(cropvars[i][0] + cropvars[i][1] - cropvars[i][2] == cropvars[i][3])
+    
+    m.Equation(cropvars[i][1] == 0)
+    m.Equation(cropvars[i][2] == 0)
+    
+    totalcropPROD += cropvars[i][0]
+    totalcropIMP += cropvars[i][1]
+    totalcropEXP += cropvars[i][2]
+    totalcropDEM+=cropvars[i][3]
+
+#m.Equation(totalcropPROD/(totalcropPROD+totalcropIMP-totalcropEXP)>=cssr)
+
+#Differentiate between fodder and agricultural crops for food conversion
+allcrops = set(crops_name)
+foddercrops = set(i.name for i in fodder)
+agricrops = len(allcrops) - len(foddercrops)
+
+#Define and populate crop to food conversion matrix
+agrifoodconversion = m.Array(m.Param,(agricrops,len(foodfromcrops)))
+
+def agrifoodconv(i,j): 
+    agrifoodconversion[j,j] = i.convfactor
+    
+j=0
+for i in foodfromcrops:
+    agrifoodconv(i,j)
+    j+=1
+    if j>= agricrops:
+        break
+    
+for i in range(agricrops):
+    #Calculate agricultural crop demand from food production variable
+    #EQUATION (12) from Mortada et al (2018)
+    m.Equation(cropvars[i][3] == agrifoodconversion[i][i] * ccagrifood[i][2])
+    
+for i in range(agricrops):
+    if ccagrifood[i][0] == 'Potatoes' or ccagrifood[i][0] == 'Beans' or ccagrifood[i][0] == 'Tomatoes' or ccagrifood[i][0] == 'Peas' or ccagrifood[i][0] == 'Oranges' or ccagrifood[i][0] == 'Bananas':
+        m.Equation(cropvars[i][0] == foodvars[i][0])
+
+
+#Define livestock class and related parameters
+class Livestock():
+
+    def __init__(self, num, group, ltype, heads, watereq, energyreq, wheatfeed,
+                 corngrainfeed, dryhayfeed, silagefeed, grazingfeed, nintakefeed,
+                nfeedeff, convfactor, nexecretions, execfraclost, CH4enteric, 
+                 CH4manure, N2Omanure, N2Opasture):
+        self.num = num 
+        self.group = group 
+        self.ltype = ltype 
+        self.heads = heads #heads
+        self.watereq = watereq #m3/head/year
+        self.energyreq = energyreq #kWh/head/year
+        self.wheatfeed = wheatfeed #ton/head/year
+        self.corngrainfeed = corngrainfeed #ton/head/year
+        self.dryhayfeed = dryhayfeed #ton/head/year
+        self.silagefeed =silagefeed #ton/head/year
+        self.grazingfeed = grazingfeed #ton/head/year
+        self.nintakefeed = nintakefeed #kgN/head/year
+        self.nfeedeff = nfeedeff #dimensionless
+        self.convfactor = convfactor #ton/ton or head/ton
+        self.nexecretions = nexecretions #kgN/head/year
+        self.execfraclost = execfraclost #dimensionaless
+        self.CH4enteric = CH4enteric #kg CO2-eq/head/year
+        self.CH4manure = CH4manure #kg CO2-eq/head/year
+        self.N2Omanure = N2Omanure #kg CO2-eq/head/year
+        self.N2Opasture = N2Opasture #kg CO2-eq/head/year
+
+#Import food data from input excel sheet and convert to list
+dlivestock = pd.read_excel(filepath, sheet_name='Livestock') 
+livestock = dlivestock.values.tolist()
+
+#Populate food class from list
+livestock_instances = []
+for i in livestock:
+    livestock_instances.append(Livestock(*i))
+
+#Define array of livestock variables: production, import, export, demand, cons of livestock m,n
+livestockvars = m.Array(m.Var,(len(livestock_instances),4), lb=0)
+
+#Define livestock to food conversion matrix
+livestockfoodconversion = m.Array(m.Param,(len(livestock_instances),len(foodfromlivestock)))
+
+#Define function for populating livestock to food conversion matrix
+def livfoodconv(i,j):
+    livestockfoodconversion[j][j] = i.convfactor
+    
+k=0
+for i in livestock_instances:
+    livfoodconv(i,k)
+    k+=1
+
+#Initialize and populate livestock individual parameter arrays
+livestock_energy=[]
+livestock_water=[]
+livestock_heads=[]
+livestock_type=[]
+livestock_feedcons=[]
+livestock_nitrogen=[]
+livestock_emissions=[]
+
+for i in livestock_instances:
+    livestock_energy.append(i.energyreq)
+    livestock_water.append(i.watereq)
+    livestock_heads.append(i.heads)
+    livestock_type.append(i.ltype)
+    livestock_feedcons.append((i.wheatfeed, i.corngrainfeed, i.dryhayfeed, i.silagefeed, i.grazingfeed))
+    livestock_nitrogen.append((i.nintakefeed, i.nfeedeff, i.nexecretions, i.execfraclost))
+    livestock_emissions.append((i.CH4enteric, i.CH4manure, i.N2Omanure, i.N2Opasture))
+
+
+#Populate array of livestock data parameters
+cclivestock=[]
+
+for i in range(len(livestock_instances)):
+    cclivestock += [(livestock_type[i], livestock_heads[i], livestockvars[i][0], livestock_water[i], livestock_energy[i],
+                       livestock_feedcons[i], livestock_nitrogen[i], livestock_emissions[i])]
+
+
+#Initialize and populate arrays of nitrogen, water, energy, and emission calculations
+liv_nintake=0
+liv_noutput=0
+liv_manureprod=0
+liv_water=0
+liv_energy=0
+liv_eneteric=0
+liv_manuremngt=0
+liv_manurepasture=0
+
+for i in range(len(livestockvars)):
+    #Calculate livestock demand from conversion matrix and food from livestock
+    #Equation 31 from Chamas et al (2021)
+    m.Equation(livestockvars[i][3] == livestockfoodconversion[i][i]*cclivfood[i][2]) #heads/yr
+    
+    #Livestock balance of production+import-export=demand in head/yr
+    #EQUATION (32) from Chamas et al (2021)
+    m.Equation(livestockvars[i][3] == livestockvars[i][0]+livestockvars[i][1]-livestockvars[i][2]) #heads/yr
+    
+    #m.Equation(livestockvars[i][1] == 0)
+    #m.Equation(livestockvars[i][2] == 0)
+
+    #Calculate livestock nitrogen input and output
+    #EQUATIONS (e) and (f) from Khattar et al (2022) suplementary
+    liv_nintake += (cclivestock[i][1]+cclivestock[i][2])*cclivestock[i][6][0] #kgN/yr
+    
+    liv_noutput += (cclivestock[i][1]+cclivestock[i][2])*cclivestock[i][6][0]*cclivestock[i][6][1] #kgN/yr
+    
+    #Calculate total water and energy consumption for livestock rearing
+    liv_water +=  (cclivestock[i][1]+cclivestock[i][2])*cclivestock[i][3] #m3/yr
+    
+    liv_energy +=  (cclivestock[i][1]+cclivestock[i][2])*cclivestock[i][4] #kWh/yr
+    
+    #Calculate manure production and emissions from livestock and manure
+    #EQUATION (21) from Khattar et al (2022)
+    liv_manureprod += (cclivestock[i][1]+cclivestock[i][2])*cclivestock[i][6][2]*cclivestock[i][6][3] #kg manure/yr
+    #EQUATION (7) from Chamas et al (2021)
+    liv_eneteric +=  (cclivestock[i][1]+cclivestock[i][2])*cclivestock[i][7][0] #kgCO2-eq/yr
+    #EQUATION (2) from Chamas et al (2021)
+    liv_manuremngt +=  (cclivestock[i][1]+cclivestock[i][2])*(cclivestock[i][7][1] + cclivestock[i][7][2]) #kgCO2-eq/yr
+    #EQUATION (3) from Chamas et al (2021)
+    liv_manurepasture +=  (cclivestock[i][1]+cclivestock[i][2])*cclivestock[i][7][3] #kgCO2-eq/yr
+
+#Equate manure production with quantity yielded from livestock
+m.Equation(liv_manureprod-manurevars[0][0]>=0)
+
+#Define feed class and related parameters
+class Feed():
+    def __init__(self, num, name, alfalfaconv, grassesconv,
+                wastefactor, lossfactor, currentcons):
+        self.num = num
+        self.name = name 
+        self.alfalfaconv = alfalfaconv
+        self.grassesconv = grassesconv
+        self.wastefactor = wastefactor
+        self.lossfactor = lossfactor
+        self.currentcons = currentcons
+
+#Import feed data from input excel sheet and convert to list
+dfeed = pd.read_excel(filepath, sheet_name='Feed') 
+feed = dfeed.values.tolist()
+
+#Populate feed class from list
+feed_instances = []
+
+for i in feed:
+    feed_instances.append(Feed(*i))
+
+#Define array of feed variables: production, import, export, demand, cons of feed i',j'
+feedvars = m.Array (m.Var, (len(feed_instances),4), lb=0)
+
+#Populate array of feed types
+ccfeed=[]
+
+for i in feed_instances:
+    ccfeed += [(i.name)]
+
+#Initialize and compute consumption quantities of each feedtype
+feedcons=[]
+
+for i in feed_instances:
+    feedcons.append(0) 
+    
+for i in range(len(livestock_instances)):
+    feedcons[0] += (cclivestock[i][1] + cclivestock[i][2]) * (cclivestock[i][5][0]) #wheat
+    feedcons[1] += (cclivestock[i][1] + cclivestock[i][2]) * (cclivestock[i][5][1]) #corn grain
+    feedcons[2] += (cclivestock[i][1] + cclivestock[i][2]) * (cclivestock[i][5][2]) #dry hay
+    feedcons[3] += (cclivestock[i][1] + cclivestock[i][2]) * (cclivestock[i][5][3]) #silage
+    feedcons[4] += (cclivestock[i][1] + cclivestock[i][2]) * (cclivestock[i][5][4]) #grasses
+
+for i in range(len(feed_instances)):
+    #Feed balance of production+import-export=demand in ton/yr
+    m.Equation(feedvars[i][3] == feedvars[i][0]+feedvars[i][1]-feedvars[i][2])
+    #m.Equation(feedvars[i][1] == 0 )
+    #m.Equation(feedvars[i][2] == 0)
+    
+    #Equate demand of each livestock to the total consumption across all livestock
+    m.Equation(feedvars[i][3] == feedcons[i])
+    
+#Define water class and related parameters
+class Water(): 
+    def __init__(self, num, source, enduse, technology, loss, energyreq, upcost):
+        #define attributes of each water u,v,w
+        self.num=num
+        self.source = source 
+        self.enduse = enduse 
+        self.technology = technology
+        self.loss = loss
+        self.energyreq = energyreq #kWh/m3
+        self.upcost = upcost
+
+#Import water data from input excel sheet and convert to list
+dwater = pd.read_excel(filepath, sheet_name='WaterSources') 
+water = dwater.values.tolist()
+
+#Populate water class from list
+water_instances = []
+for i in water:
+    water_instances.append(Water(*i))
+    
+#Define array of water production variables
+waterprodvars = m.Array(m.Var,(len(water_instances),1), lb=0)
+
+
+#Initialize and populate indivdual water parameter arrays
+water_enduse=[]
+water_sources=[]
+water_technology=[]
+water_loss=[]
+water_energy=[]
+water_upcost=[]
+
+for i in water_instances:
+    water_sources.append(i.source)
+    water_enduse.append(i.enduse)
+    water_technology.append(i.technology)
+    water_loss.append(i.loss)
+    water_energy.append(i.energyreq)
+    water_upcost.append(i.upcost)
+
+
+#Populate array of all water data parameters
+ccwater=[]
+
+for i in range(len(water_instances)):
+    ccwater += [(water_sources[i], water_enduse[i], water_technology[i], water_loss[i],waterprodvars[i][0], water_energy[i], water_upcost[i])]
+
+#production and demand variables for water sector
+watersourcevars = m.Array(m.Var, (len(set(water_sources)), 2), lb=0)
+waterendvars = m.Array(m.Var, (len(set(water_enduse)), 2), lb=0)
+
+#Differentiate between water consumption sources and end uses
+waterCons=[] #surface water, groundwater, seawater, wastewater
+waterEndUse=[] #domestic, industrial, agricultural/energy?
+waterProd=[]
+fwcons = 0
+
+for i in range(len(list(set(water_sources)))):
+    waterCons.append(0)
+    waterProd.append(0)
+    
+for i in range(len(list(set(water_enduse)))):
+    waterEndUse.append(0)
+
+totalwatercost=0
+
+
+#EQUATION (15) from Chamas et al (2021) for water production based on end use
+#EQUATION (16) from Chamas et al (2021) for water production based on water source
+for i in range(len(ccwater)):
+    if ccwater[i][0] == 'Surface Water':
+        waterProd[0] += ccwater[i][4]
+        waterCons[0] += ccwater[i][4]*(1+ccwater[i][3])
+        totalwatercost += ccwater[i][4]*ccwater[i][6]
+    if ccwater[i][0] == 'Groundwater':
+        waterProd[1] += ccwater[i][4]
+        waterCons[1] += ccwater[i][4]*(1+ccwater[i][3])
+        totalwatercost += ccwater[i][4]*ccwater[i][6]
+    if ccwater[i][0] == 'Seawater':
+        waterProd[2] += ccwater[i][4]
+        waterCons[2] += ccwater[i][4]*(1+ccwater[i][3])
+        totalwatercost += ccwater[i][4]*ccwater[i][6]
+    if ccwater[i][0] == 'Wastewater':
+        waterProd[3] += ccwater[i][4]
+        waterCons[3] += ccwater[i][4]*(1+ccwater[i][3])
+        totalwatercost += ccwater[i][4]*ccwater[i][6]
+    if ccwater[i][1] == 'Domestic':
+        waterEndUse[0] += ccwater[i][4]
+    if ccwater[i][1] == 'Industrial':
+        waterEndUse[1] += ccwater[i][4]
+    if ccwater[i][1] == 'Agriculture':
+        waterEndUse[2] += ccwater[i][4]
+
+#Compute total energy needed for water treatment 
+totalenergyforwater=0
+for i in range(len(ccwater)):
+    totalenergyforwater += ccwater[i][4]*ccwater[i][5]
+
+fwcons = waterCons[0]+waterCons[1]
+
+#Define energy class and related parameters
+class Energy():
+    def __init__(self, num, primary, technology, carrier, enduse, watereq, landreq, 
+                 conversion, emissions, cprod, cimp, cexp,typ):
+        self.id = num
+        self.primary = primary
+        self.technology = technology
+        self.carrier = carrier
+        self.enduse = enduse 
+        self.watereq = watereq #m3/kWh
+        self.landreq = landreq # m2/kWh
+        self.conversion = conversion 
+        self.emissions = emissions #g CO2 equivalent per kWh
+        self.cprod=cprod #$/kWh
+        self.cimp=cimp #$/kWh
+        self.cexp=cexp #$/kWh
+        self.typ=typ
+
+#Import water data from input excel sheet and convert to list
+denergy = pd.read_excel(filepath, sheet_name='EnergySources') 
+energy = denergy.values.tolist()
+
+#Populate energy class from list
+energy_instances = []
+for i in energy:
+    energy_instances.append(Energy(*i))
+
+#Separate instances of electricity generation
+electricitygeneration = [i for i in energy_instances if i.carrier=='Electricity']
+
+#Idenitfy number of unique energy carriers
+numcarriers= set([i.carrier for i in energy_instances])
+
+#Define array of energy production variables
+energyprodvars = m.Array(m.Var, (len(energy_instances), 1),lb=0) #unit of kWh
+
+#Initialize and populate indivdual water parameter arrays
+energy_source=[]
+energy_tech=[]
+energy_carrier=[]
+energy_enduse=[]
+energy_conversion=[]
+energy_water=[]
+energy_land=[]
+energy_emissions=[]
+energy_cprod=[]
+energy_cimp=[]
+energy_cexp=[]
+energy_typ=[]
+
+for i in energy_instances:
+    energy_source.append(i.primary)
+    energy_tech.append(i.technology)
+    energy_carrier.append(i.carrier)
+    energy_enduse.append(i.enduse)
+    energy_conversion.append(i.conversion)
+    energy_water.append(i.watereq)
+    energy_land.append(i.landreq)
+    energy_emissions.append(i.emissions)
+    energy_cprod.append(i.cprod)
+    energy_cimp.append(i.cimp)
+    energy_cexp.append(i.cexp)
+    energy_typ.append(i.typ)
+
+#Populate array of all water data parameters  
+ccenergy=[]
+
+for i in range(len(energy_instances)):
+    ccenergy += [(energy_source[i], energy_tech[i], energy_carrier[i], energy_enduse[i],
+                  energy_conversion[i], energyprodvars[i][0], energy_water[i], 
+                  energy_land[i], energy_emissions[i], energy_cprod[i], energy_cimp[i], 
+                 energy_cexp[i],energy_typ)]
+
+#Initialize and populate arrays for energy consumption and land calculations
+energyCarrier=[] #electricity
+energyCons=[] #petroleum, ng, solar, bm, hydropower,wind
+energyLand = [] #petroleum, ng, solar, bm, hydropower,wind
+energyEndUse =[] #domestic, industrial, agricultural/WEF
+totalenergyprod = [] #petroleum, ng, solar, biomass, hdydro, wind
+
+for i in range(len(list(set(energy_carrier)))):
+    energyCarrier.append(0)
+
+for i in range(len(list(set(energy_source)))):
+    energyCons.append(0)
+    energyLand.append(0)
+    totalenergyprod.append(0)
+    
+for i in range(len(list(set(energy_enduse)))):
+    energyEndUse.append(0)
+
+    
+#Calculate land requirements and consumption quantities by source and end use
+##EQUATION (19) from Chamas et al (2021) for consumption of energy sources (demand)
+#EQUATION (23) from Chamas et al (2021) for land calculations
+for i in range(len(ccenergy)):
+    if ccenergy[i][0] == 'Petroleum':
+        energyCons[0] += ccenergy[i][5]/ccenergy[i][4] #unit of e
+        energyLand[0] += ccenergy[i][5] * ccenergy[i][7] # m2
+        totalenergyprod[0] += ccenergy[i][5] # kWh
+    if ccenergy[i][0] == 'Natural Gas':
+        energyCons[1] += ccenergy[i][5]/ccenergy[i][4]
+        energyLand[1] += ccenergy[i][5] * ccenergy[i][7]
+        totalenergyprod[1] += ccenergy[i][5]
+    if ccenergy[i][0] == 'Solar':
+        energyCons[2] += ccenergy[i][5]/ccenergy[i][4]
+        energyLand[2] += ccenergy[i][5] * ccenergy[i][7]
+        totalenergyprod[2] += ccenergy[i][5]
+    if ccenergy[i][0] == 'Biomass':
+        energyCons[3] += ccenergy[i][5]/ccenergy[i][4]
+        energyLand[3] += ccenergy[i][5] * ccenergy[i][7]
+        totalenergyprod[3] += ccenergy[i][5]
+    if ccenergy[i][0] == 'Hydropower':
+        energyCons[4] += ccenergy[i][5]/ccenergy[i][4]
+        energyLand[4] += ccenergy[i][5] * ccenergy[i][7]
+        totalenergyprod[4] += ccenergy[i][5]
+    if ccenergy[i][0] == 'Wind':
+        energyCons[5] += ccenergy[i][5]/ccenergy[i][4]
+        energyLand[5] += ccenergy[i][5] * ccenergy[i][7]
+        totalenergyprod[5] += ccenergy[i][5]
+    if ccenergy[i][2] == 'Electricity':
+        #EQUATION (20) from Chamas et al (2021)
+        energyCarrier[0] += ccenergy[i][5]
+    if ccenergy[i][3] == 'Domestic':
+        energyEndUse[0] += ccenergy[i][5]
+    if ccenergy[i][3] == 'Industrial':
+        energyEndUse[1] += ccenergy[i][5]
+    if ccenergy[i][3] == 'Agriculture':
+        energyEndUse[2] += ccenergy[i][5]
+
+nonren = totalenergyprod[0] + totalenergyprod[1]
+
+#Define array of energy variables: production, import, export, demand, cons of energy e and g
+energysources = m.Array(m.Var, (len(energyCons), 4), lb=0)
+energycarriers = m.Array(m.Var, (len(energyCarrier), 4), lb=0)
+totalenergycost=0
+totalenergyimpcost=0
+totalenergyexpcost=0
+
+#Sum/calculate all demand for end uses
+foodenergydemand = tfer + totalenergyforcrops + fertenergy +liv_energy 
+indenergydemand = totalenergyforwater
+domenergydemand= 3000*pop #per capita consumption for domestic use
+energydemand = [domenergydemand,indenergydemand,foodenergydemand]
+
+#Specify energy supply
+denergysupply=pd.read_excel(filepath, sheet_name='EnergySupply') 
+energysupply = denergysupply['Supply'].tolist() #petroluem, ng, solar, bm, hydropower,wind
+energy_conv = [0.71, 3.39, 744.0, 10.2, 600.0, 602.25]
+
+totalenergysourceprod=0
+totalenergyp=0
+totalenergyi=0
+totalenergye=0
+totalenergydem=0
+totalenergyimported=0
+totalenergyexported=0
+
+#Balance of energy source and carrier variables: production+import-export=demand in kWh/year
+for i in range(len(energysources)):
+    
+    #EQUATION 22 from Chamas et al (2021)
+    m.Equation(energysources[i][0] + energysources[i][1] - energysources[i][2] == energysources[i][3])
+    m.Equation(energysources[i][3] == energyCons[i])
+    m.Equation(energysources[i][0] <= energysupply[i])
+    
+    m.Equation(energysources[i][2] == 0)
+    m.Equation(energysources[i][1] == 0)
+    
+    totalenergycost=ccenergy[i][9]*energysources[i][0]
+    totalenergyimpcost=ccenergy[i][10]*energysources[i][1]
+    totalenergyexpcost=ccenergy[i][11]*energysources[i][2]
+    
+    totalenergysourceprod += energysources[i][0]
+    totalenergyp += energysources[i][0]/energy_conv[i]
+    totalenergyimported += energysources[i][1]/energy_conv[i]
+    totalenergyi += energysources[i][1]
+    totalenergyexported += energysources[i][2]/energy_conv[i]
+    totalenergye += energysources[i][2]
+    
+
+for i in range(len(energycarriers)):
+    #EQUATION 21 from Chamas et al (2021)
+    m.Equation(energycarriers[i][0] + energycarriers[i][1] - energycarriers[i][2] == energycarriers[i][3])
+    m.Equation(energycarriers[i][3] == energyCarrier[i])
+    
+    m.Equation(sum(totalenergyprod) == energycarriers[i][0])
+    
+    totalenergydem+=energycarriers[i][3]
+
+#Constraints to meet demand and stay within supply
+for i in range(len(energyEndUse)):
+    m.Equation(energyEndUse[i] == energydemand[i])
+
+
+#Calculate water requirements and emission quantities     
+totalwaterforenergy=0
+totalGHGenergy=0
+
+for i in range(len(ccenergy)):
+    totalGHGenergy += energyprodvars[i][0] * energy_emissions[i] #g CO2-eq
+    totalwaterforenergy += ccenergy[i][5] * ccenergy[i][6]
+
+#Calculate total energy consumed
+totalenergy = tfer + totalenergyforcrops + fertenergy + totalenergyforwater + liv_energy 
+
+#Compute total amount of water needed for end use sectors
+waterforagri = tfwr + totalbluewater + fertwater +liv_water 
+waterforind = totalwaterforenergy
+waterdomestic = pop* 63.875 #m3/yr
+
+#Specify water supply limits
+dwatersupply = pd.read_excel(filepath, sheet_name='WaterSupply') 
+waterSupply = dwatersupply['Supply'].tolist()#surface water, groundwater, seawater, wastewater
+
+#Specify water demand for sectors
+waterDemand = [waterdomestic,waterforind,waterforagri] #domestic, industrial, food
+
+#Constraint for available water supply
+for i in range(len(watersourcevars)):
+    #EQUATION (16) from Chamas et al (2021): production of each source is summation across technologies and end-uses
+    m.Equation(watersourcevars[i][0] == waterProd[i])
+    #EQUATION (17) from Chamas et al (2021): demand equals water produced accounting for losses
+    m.Equation(watersourcevars[i][1] == waterCons[i])
+    #EQUATION (18) from Chamas et al (2021): water supply availability
+    m.Equation(watersourcevars[i][1] <= waterSupply[i])
+
+
+for i in range(len(waterendvars)):
+    #EQUATION (14) from Chamas et al(2021): ensure water demand satisfaction
+    m.Equation(waterDemand[i] == waterEndUse[i])
+    m.Equation(waterendvars[i][0] == waterEndUse[i])
+    m.Equation(waterendvars[i][0] == waterendvars[i][1])
+    
+totalwater = tfwr + totalbluewater + fertwater + totalwaterforenergy +liv_water
+
+#Ensure water costs are within allocated water budget
+m.Equation(totalwatercost<=info[4])
+
+#Ensure energy costs are within allocated energy budget
+m.Equation(totalenergycost <= info[5])
+m.Equation(totalenergyimpcost <= info[10])
+m.Equation(totalenergyexpcost >= info[9])
+
+#Ensure food costs are within allocated food budget
+m.Equation(totalfoodcost <= info[6])
+m.Equation(totalfoodimpcost <= info[8])
+m.Equation(totalfoodexpcost >= info[7])
+
+#Calculate total land for energy needs
+landforenergy=sum(energyLand) #m2
+TAL = info[1] #ha
+availcropland = info[2] #0.18*pop #ha
+availenergyland = info[3]
+
+#Specify cultivated land constraint
+m.Equation(totalcropland <= availcropland)
+m.Equation(landforenergy*0.0001 <= availenergyland)
+m.Equation(totalcropland+(landforenergy*0.0001)<=0.5*TAL)
+
+totalGHGfood =  cropManFertEmisssions + liv_manuremngt + liv_manurepasture +liv_eneteric #kgCO2
+
+totalGHG = (totalGHGenergy/1000) + totalGHGfood #kg CO2
+
+#Specify planetary boundaries
+m.Equation((totalGHG*0.001)/pop <= 1610) # ton GHG, EQUATION (24) from Chamas et al(2021)
+m.Equation((waterCons[0]+waterCons[1])/pop<=574)#freshwater 
+m.Equation((sum(NcropsAddedTotal) + sum(NcropsNatTotal))/pop<=8.9) #nitrogen, EQUATION (28) from Khattar et al (2022)
+
+m.Minimize((totalenergy + totalenergysourceprod))
+m.Maximize(totalfoodprod)
+m.Minimize(totalwater)
+
+m.options.SOLVER=1
+m.options.MAX_ITER=10000000
+m.solve()
+
+
+Fnames = [ccfood[i][0] for i in range(len(ccfood))]
+FPD = [foodvars[i][0].value for i in range(len(foodvars))]
+FIV = [foodvars[i][1].value for i in range(len(foodvars))]
+FEV = [foodvars[i][2].value for i in range(len(foodvars))]
+FDV = [foodvars[i][3].value for i in range(len(foodvars))]
+FCV = [foodvars[i][4].value for i in range(len(foodvars))]
+Fwater = [FPD[i][0] * ccfood[i][3] for i in range(len(foodvars))]
+Fenergy = [FPD[i][0] * ccfood[i][4] for i in range(len(foodvars))]
+Fprodcost = [FPD[i][0] * ccfood[i][11] for i in range(len(foodvars))]
+Fimpcost = [FIV[i][0] * ccfood[i][12] for i in range(len(foodvars))]
+Fexpcost = [FEV[i][0] * ccfood[i][13] for i in range(len(foodvars))]
+
+Fprodvars = []
+Fimpvars = []
+Fexpvars = []
+Fdemvars = []
+Fconsvars = []
+
+
+for i in range(len(FPD)):
+    Fprodvars.append(0)
+    Fimpvars.append(0)
+    Fexpvars.append(0)
+    Fdemvars.append(0)
+    Fconsvars.append(0)
+
+for i in range(len(FPD)):
+    Fprodvars[i] = FPD[i][0]
+    Fimpvars[i] = FIV[i][0]
+    Fexpvars[i] = FEV[i][0]
+    Fdemvars[i] = FDV[i][0]
+    Fconsvars[i] = FCV[i][0]
+
+agrifood = [Fdemvars[i] for i in range(0,12)]
+livestockfood = [Fdemvars[i] for i in range(9,13)]
+
+
+Cnames = [crops_name[i] for i in range(len(set(crops_name)))]
+CPV = [cropvars[i][0].value for i in range(len(cropvars))]
+CIV= [cropvars[i][1].value for i in range(len(cropvars))]
+CEV = [cropvars[i][2].value for i in range(len(cropvars))]
+CDV = [cropvars[i][3].value for i in range(len(cropvars))]
+
+Cprodvars=[]
+Cimpvars=[]
+Cexpvars=[]
+Cdemvars=[]
+
+for i in range(len(cropvars)):
+    Cprodvars.append(0)
+    Cimpvars.append(0)
+    Cexpvars.append(0)
+    Cdemvars.append(0)
+    
+for i in range(len(cropvars)):
+    Cprodvars[i] = CPV[i][0]
+    Cimpvars[i] = CIV[i][0]
+    Cexpvars[i] = CEV[i][0]
+    Cdemvars[i] = CDV[i][0]
+    
+cfodder = [Cdemvars[i] for i in range(9,11)]
+
+ccrop = [crops_name[i] for i in range(len(crops_name))]
+cgroup = [crops_group[i] for i in range(len(crops_group))]
+cclim = [crops_climate[i] for i in range(len(crops_climate))]
+cdist = [crops_district[i] for i in range(len(crops_district))]
+csoil = ['Silty' for i in range(len(cropprodvars))]
+cirr = [crops_irrtech[i] for i in range(len(crops_irrtech))]    
+cPV = [cropprodvars[i][0].value for i in range(len(cropprodvars))]    
+cMV = [(manureAdd[i][0].value) for i in range(len(manureAdd))]
+cFV = [NfertAdd[i][0].value for i in range(len(NfertAdd))]
+cland = [cPV[i][0]/crops_yield[i][1] for i in range(len(cropprodvars))]
+cbwater = [cPV[i][0]*crops_water[i][0] for i in range(len(cropprodvars))]
+cgwater = [cPV[i][0]*crops_water[i][1] for i in range(len(cropprodvars))]
+cenergy = [cPV[i][0]*crops_energy[i] for i in range(len(cropprodvars))]
+ctotalmanure = [cMV[i][0]*cland[i] for i in range(len(cropprodvars))]
+ctotalfertilizer = [cFV[i][0]*cland[i] for i in range(len(cropprodvars))]
+NN = [cland[i] *(cccrops[i][13][0] + cccrops[i][13][1] + cccrops[i][13][2]) for i in range(len(cropprodvars))]
+NA = [cland[i] *(cMV[i][0]+cFV[i][0]) for i in range(len(cropprodvars))]
+NO = [cPV[i][0] * cccrops[i][13][3] * 1000 for i in range(len(cropprodvars))]
+NL = [cland[i]*( 0.006*cMV[i][0]+ 0.01*cFV[i][0]) + (0.1*cMV[i][0] + 0.150*cFV[i][0]) + (0.3*cMV[i][0] + 0.3*cFV[i][0]) for i in range(len(cropprodvars))]
+
+cprod=[]
+cmanure=[]
+cfertilizer=[]
+
+for i in range(len(cropprodvars)):
+    cprod.append(0)
+    cmanure.append(0)
+    cfertilizer.append(0)
+    
+for i in range(len(cropprodvars)):
+    cprod[i] =cPV[i][0]
+    cmanure[i] = cMV[i][0]
+    cfertilizer[i] = cFV[i][0]
+        
+    
+FertPV = [fertvars[0][0].value]
+FertIV = [fertvars[0][1].value]
+FertEV = [fertvars[0][2].value]
+FertDV = [fertvars[0][3].value]
+
+fertilizervars = [FertPV[0][0], FertIV[0][0], FertEV[0][0], FertDV[0][0]]
+
+ManPV = manurevars[0][0].value
+ManIV = manurevars[0][1].value
+ManEV = manurevars[0][2].value
+ManDV = manurevars[0][3].value
+    
+fertem = fertilizervars[0]*0.01*(44/28)*265
+    
+Wsource = [water_sources[i] for i in range(len(water_sources))]
+Wtech = [water_technology[i] for i in range(len(water_technology))]
+Wenduse = [water_enduse[i] for i in range(len(water_enduse))]
+WPD = [waterprodvars[i][0].value for i in range(len(waterprodvars))]
+WDD = [waterendvars[i][0].value for i in range(len(waterendvars))]
+Wenergy = [WPD[i][0]*water_energy[i] for i in range(len(waterprodvars))]
+Wcost = [WPD[i][0]*water_upcost[i] for i in range(len(waterprodvars))]
+Wprodvars=[]
+Wdemvars=[]
+
+for i in range(len(WPD)):
+    Wprodvars.append(0)
+for i in range(len(WDD)):
+    Wdemvars.append(0)
+
+for i in range(len(WPD)):
+    Wprodvars[i] = WPD[i][0]
+
+for i in range(len(WDD)):
+    Wdemvars[i] = WDD[i][0]
+
+
+EPV = [energyprodvars[i][0].value for i in range(len(energyprodvars))]
+Eprimary = [energy_source[i] for i in range(len(EPV))]
+Etech = [energy_tech[i] for i in range(len(EPV))]
+Ecarrier = [energy_carrier[i] for i in range(len(EPV))]
+Eenduse = [energy_enduse[i] for i in range(len(EPV))]
+
+Eprodvars=[]
+
+for i in range(len(EPV)):
+    Eprodvars.append(0)
+
+for i in range(len(EPV)):
+    Eprodvars[i] = EPV[i][0]
+        
+Esource = [energy_source[i] for i in range(len(set(Eprimary)))]
+Epcost = [energy_cprod[i] for i in range(len(set(Eprimary)))]
+Eicost = [energy_cimp[i] for i in range(len(set(Eprimary)))]
+Eecost = [energy_cexp[i] for i in range(len(set(Eprimary)))]
+Econv= [energy_conversion[i] for i in range(len(set(Eprimary)))]
+ESPV = [energysources[i][0].value for i in range(len(energysources))]
+ESIV = [energysources[i][1].value for i in range(len(energysources))]
+ESEV = [energysources[i][2].value for i in range(len(energysources))]
+ESDV = [energysources[i][3].value for i in range(len(energysources))]
+Esland = [energy_land[i] for i in range(len(energysources))]
+Ewater = [energy_water[i] for i in range(len(energysources))]
+Eemissions = [energy_emissions[i]/1000 for i in range(len(energysources))]
+
+
+Esourceprod =[]
+Esourceimp = []
+Esourceexp = []
+Esourcedem = []
+
+for i in range(len(ESPV)):
+    Esourceprod.append(0)
+    Esourceimp.append(0)
+    Esourceexp.append(0)
+    Esourcedem.append(0)
+
+for i in range(len(ESPV)):
+    Esourceprod[i] = ESPV[i][0]
+    Esourceimp[i] = ESIV[i][0]
+    Esourceexp[i] = ESEV[i][0]
+    Esourcedem[i] = ESDV[i][0]
+
+Eprodcost = [Esourceprod[i]*Econv[i] * Epcost[i] for i in range(len(Esource))]
+Eimpcost = [(Esourceimp[i]*Econv[i]) * Eicost[i] for i in range(len(Esource))]
+Eexpcost = [(Esourceexp[i]*Econv[i]) * Eecost[i] for i in range(len(Esource))]
+Eland = [(Esourceprod[i]*Econv[i]) * Esland[i] for i in range(len(Esource))]
+Eprod = [Esourceprod[i]*Econv[i] for i in range(len(Esource))]
+Eimp = [Esourceimp[i]*Econv[i] for i in range(len(Esource))]
+Eexp = [Esourceexp[i]*Econv[i] for i in range(len(Esource))]
+Edem = [Esourcedem[i]*Econv[i] for i in range(len(Esource))]
+EWater = [(Esourceprod[i]*Econv[i]) * Ewater[i] for i in range(len(Esource))]
+EEmissions = [(Esourceprod[i]*Econv[i]) * Eemissions[i] for i in range(len(Esource))] #kilograms
+
+Eunits = ['L', 'm3', 'm2', 'ton', 'm3', 'm2']
+
+
+
+Lnames = [livestock_type[i] for i in range(len(livestock_type))]
+Lpop = [livestock_heads[i] for i in range(len(livestock_type))]
+LPD = [livestockvars[i][0].value for i in range(len(livestockvars))]
+LIV = [livestockvars[i][1].value for i in range(len(livestockvars))]
+LEV = [livestockvars[i][2].value for i in range(len(livestockvars))]
+LDV = [livestockvars[i][3].value.value for i in range(len(livestockvars))]
+Lwater = [(LPD[i][0]+cclivestock[i][1])*cclivestock[i][3] for i in range(len(livestockvars))]
+Lenergy = [(LPD[i][0]+cclivestock[i][1])*cclivestock[i][4] for i in range(len(livestockvars))]
+Lenetric = [((LPD[i][0]+cclivestock[i][1])*cclivestock[i][7][0]) for i in range(len(livestockvars))] #kg
+Lmanuremngt = [((LPD[i][0]+cclivestock[i][1])*(cclivestock[i][7][1] + cclivestock[i][7][2])) for i in range(len(livestockvars))] #kg
+Lmanureprod = [((LPD[i][0]+cclivestock[i][1])*cclivestock[i][6][2]*cclivestock[i][6][3]) for i in range(len(livestockvars))] #kg
+Lmanurepasture = [((LPD[i][0]+cclivestock[i][1])*cclivestock[i][7][3]) for i in range(len(livestockvars))] #kg
+LNin = [(LPD[i][0]*cclivestock[i][6][0]) for i in range(len(livestockvars))]
+LNout = [(LPD[i][0]*cclivestock[i][6][0]*cclivestock[i][6][1]) for i in range(len(livestockvars))]
+
+Lprodvars=[]
+Limpvars=[]
+Lexpvars=[]
+Ldemvars=[]
+
+for i in range(len(LPD)):
+    Lprodvars.append(0)
+    Limpvars.append(0)
+    Lexpvars.append(0)
+    Ldemvars.append(0)
+
+for i in range(len(LPD)):
+    Lprodvars[i] = LPD[i][0]
+    Limpvars[i] = LIV[i][0]
+    Lexpvars[i] = LEV[i][0]
+    Ldemvars[i] = LDV[i][0]
+        
+livprod=[]
+fconsv=[]
+
+for i in range(len(livestock_instances)):
+    livprod.append(0)
+
+for i in range(len(feed_instances)):
+    fconsv.append(0)
+    
+for i in range(len(livestock_instances)):
+    livprod[i] = cclivestock[i][2].value
+
+for i in range(len(livestock_instances)):
+    fconsv[0] += (cclivestock[i][1] + livprod[i][0]) * (cclivestock[i][5][0])
+    fconsv[1] += (cclivestock[i][1] + livprod[i][0]) * (cclivestock[i][5][1])
+    fconsv[2] += (cclivestock[i][1] + livprod[i][0]) * (cclivestock[i][5][2])
+    fconsv[3] += (cclivestock[i][1] + livprod[i][0]) * (cclivestock[i][5][3])
+    fconsv[4] += (cclivestock[i][1] + livprod[i][0]) * (cclivestock[i][5][4])
+
+
+fnames = [ccfeed[i] for i in range(len(ccfeed))]
+fPD = [feedvars[i][0].value for i in range(len(feedvars))]
+fIV = [feedvars[i][1].value for i in range(len(feedvars))]
+fEV = [feedvars[i][2].value for i in range(len(feedvars))]
+fDV =  [feedvars[i][3].value for i in range(len(feedvars))]
+fconsvars = [fconsv[i] for i in range(len(fconsv))]
+
+fprodvars=[]
+fimpvars=[]
+fexpvars=[]
+fdemvars=[]
+
+
+for i in range(len(fPD)):
+    fprodvars.append(0)
+    fimpvars.append(0)
+    fexpvars.append(0)
+    fdemvars.append(0)
+
+for i in range(len(fPD)):
+    fprodvars[i] = fPD[i][0]
+    fimpvars[i] = fIV[i][0]
+    fexpvars[i] = fEV[i][0]
+    fdemvars[i] = fDV[i][0]
+
+livestockresults = pd.DataFrame({'Livestock':Lnames, 'Current population, [heads]':Lpop, 'Production, [head/yr]':Lprodvars, 
+                                 'Import, [head/yr]':Limpvars, 
+                                 'Export, [head/yr]':Lexpvars, 'Demand, [head/yr]':Ldemvars, 
+                                 'Water, [m3/yr]':Lwater,'Energy, [kWh/yr]':Lenergy})
+
+feedresults = pd.DataFrame({'Feed':fnames, 'Production, [ton/yr]':fprodvars, 'Import, [ton/yr]':fimpvars, 
+                            'Export, [ton/yr]':fexpvars, 'Demand, [ton/yr]':fdemvars, 
+                            'Consumption, [ton/yr]':fconsvars})
+
+foodresults = pd.DataFrame({'Food':Fnames, 'Production, [ton/yr]':Fprodvars, 'Import, [ton/yr]': Fimpvars, 
+                            'Export, [ton/yr]':Fexpvars, 'Demand, [ton/yr]':Fdemvars, 
+                            'Consumption, [g/capita/d]':Fconsvars, 'Water, [m3/yr]':Fwater, 
+                            'Energy, [kWh/yr]':Fenergy})
+
+cropresults = pd.DataFrame({'Crops':Cnames, 'Production, [ton/yr]':Cprodvars, 
+                            'Import, [ton/yr]':Cimpvars, 'Export, [ton/yr]':Cexpvars, 
+                            'Demand, [ton/yr]':Cdemvars})
+
+cropdetresults = pd.DataFrame({'Crop':ccrop, 'Group':cgroup, 'Climate':cclim, 
+                               'Irrigation':cirr, 
+                              'Production, [ton/yr]':cprod, 'Manure [kgN/yr]':ctotalmanure, 
+                               'Fertilizer [kgN/yr]':ctotalfertilizer, 
+                               'Land , [ha]':cland,
+                              'Blue Water, [m3/yr]':cbwater, 'Green Water, [m3/yr]':cgwater, 
+                               'Energy , [kWh/yr]':cenergy})
+
+wateresults = pd.DataFrame({'Source':Wsource, 'Technology':Wtech, 'Enduse':Wenduse, 
+                            'Production, [m3/yr]':Wprodvars, 'Energy, [kWh/yr]':Wenergy})
+
+energydetresults = pd.DataFrame({'Primary Source':Eprimary, 'Technology':Etech, 'Carrier':Ecarrier, 'Enduse':Eenduse,
+                             'Allocation, [kWh/yr]':Eprodvars })
+
+energyresults = pd.DataFrame({'Source':Esource, 'Units': Eunits, 'Production':Esourceprod, 'Import':Esourceimp,
+                             'Export':Esourceexp, 'Demand':Esourcedem, 'Production, [kWh]':Eprod, 'Water, [m3]': EWater,
+                             'Land, (m2)':Eland, 'Emissions, [kg CO2]': EEmissions, 'Production Cost, [USD]': Eprodcost,
+                             'Import Cost, [USD]': Eimpcost, 'Export Cost, [USD]': Eexpcost })
+
+Categoriesv = ['Production [(tons, m3, kWh)/yr]', 'Import [(tons, m3, kWh)/yr]', 'Export [(tons, m3, kWh)/yr]' , 
+               'Demand [(tons, m3, kWh)/yr]', 'Energy [kWh/yr]', 'Water [m3/yr]',
+             'Emissions [tons/yr]', 'Production cost, [USD]', 'Import cost, [USD]', 'Export cost, [USD]',
+              '','','', 'Objective value: Food, [ton]','Objective value: Energy, [kWh]', 'Objective value: Water, [m3]', 
+               'Total emissions, [tons]', 'Total cultivated land, [ha]', 'Total land for energy, [m2]',
+               'Total nitrogen input, [kgN]', 'Total nitrogen output, [kgN]']
+
+Foodv = [sum(Fprodvars), sum(Fimpvars), sum(Fexpvars), sum(Fdemvars),
+        sum(Fenergy), sum(Fwater), 0, sum(Fprodcost), sum(Fimpcost), sum(Fexpcost), '','','',
+        sum(Fprodvars),sum(Eprod),sum(Wprodvars), (sum(EEmissions) + sum(Lenetric) + sum(Lmanuremngt) + sum(Lmanurepasture) + fertem)/1000,
+        sum(cland), sum(Eland), sum(LNin) + sum(NA) + sum(NN), sum(NO) + sum(LNout),]
+
+Cropv = [sum(Cprodvars), sum(Cimpvars), sum(Cexpvars), sum(Cdemvars),
+        sum(cenergy), sum(cbwater), 0, 0, 0, 0, '','','', '','','','','','','','']
+
+Livestockv = [sum(Lprodvars), sum(Limpvars), sum(Lexpvars), sum(Ldemvars),
+             sum(Lenergy), sum(Lwater), sum(Lenetric)/1000, 0, 0, 0, '','','', '','','','','','','','']
+
+Feedv = [sum(fprodvars), sum(fimpvars), sum(fexpvars), sum(fdemvars), 
+        0, 0, 0, 0, 0, 0, '','','', '','','','','','','','']
+               
+Energyv = [sum(Eprod), sum(Eimp), sum(Eexp), sum(Edem),
+          0, sum(EWater), sum(EEmissions)/1000, sum(Eprodcost), sum(Eimpcost), sum(Eexpcost), 
+           '','','', '','','','','','','','']
+
+Waterv = [sum(Wprodvars), 0, 0, sum(Wdemvars),
+         sum(Wenergy), 0, 0,sum(Wcost), 0, 0, '','','', '','','','','','','','']
+
+Fertilizerv = [FertPV[0][0], FertIV[0][0],FertEV[0][0],FertDV[0][0],
+              173*sum(ctotalfertilizer), 12.8*sum(ctotalfertilizer), fertem, 0, 0, 0, 
+               '','','', '','','','','','','','']
+
+Manurev = [ManPV[0],ManIV[0],ManEV[0], ManDV[0],
+          0,0,(sum(Lmanuremngt) + sum(Lmanurepasture))/1000,0, 0, 0, '','','', '','','','','','','','']
+
+resultstograph = pd.DataFrame({'': Categoriesv, 'Food': Foodv, 'Crops': Cropv,
+                               'Livestock': Livestockv, 'Feed': Feedv,
+                               'Fertilizer': Fertilizerv, 'Manure': Manurev,
+                               'Energy': Energyv,'Water': Waterv})
+                               
+# Create a Pandas Excel writer 
+writer = pd.ExcelWriter(respath, engine='xlsxwriter')
+
+# Convert the dataframe to an Excel object.
+resultstograph.to_excel(writer, sheet_name='Results',index=False)
+foodresults.to_excel(writer, sheet_name='Food', index=False)
+cropresults.to_excel(writer, sheet_name='Crops', index=False)
+cropdetresults.to_excel(writer, sheet_name='Crops-Breakdown', index=False)
+livestockresults.to_excel(writer, sheet_name='Livestock', index=False)
+feedresults.to_excel(writer, sheet_name='Feed', index=False)
+wateresults.to_excel(writer, sheet_name='Water', index=False)
+energyresults.to_excel(writer, sheet_name='Energy', index=False)
+energydetresults.to_excel(writer, sheet_name='Energy-Breakdown', index=False)
+
+# Get the workbook and worksheet objects
+workbook  = writer.book
+worksheet1 = writer.sheets['Results']
+worksheet2 = writer.sheets['Food']
+worksheet3 = writer.sheets['Crops']
+worksheet4 = writer.sheets['Crops-Breakdown']
+worksheet5 = writer.sheets['Livestock']
+worksheet6 = writer.sheets['Feed']
+worksheet7 = writer.sheets['Water']
+worksheet8 = writer.sheets['Energy']
+worksheet9 = writer.sheets['Energy-Breakdown']
+
+# Add some cell format
+format1 = workbook.add_format({'num_format': '#,##0.00'})
+
+
+# Set the column width and format
+worksheet1.set_column(0, 0, 25)
+worksheet1.set_column(1, 1, 10, format1)
+worksheet1.set_column(2, 2, 10, format1)
+worksheet1.set_column(3, 3, 10, format1)
+worksheet1.set_column(4, 4, 10, format1)
+worksheet1.set_column(5, 5, 10, format1)
+worksheet1.set_column(6, 6, 10, format1)
+worksheet1.set_column(7, 7, 10, format1)
+worksheet1.set_column(8, 8, 10, format1)
+
+worksheet2.set_column(0, 0, 12)
+worksheet2.set_column(1, 1, 16, format1)
+worksheet2.set_column(2, 2, 14, format1)
+worksheet2.set_column(3, 3, 14, format1)
+worksheet2.set_column(4, 4, 14, format1)
+worksheet2.set_column(5, 5, 21, format1)
+worksheet2.set_column(6, 6, 14, format1)
+worksheet2.set_column(7, 7, 14, format1)
+
+worksheet3.set_column(0, 0, 15)
+worksheet3.set_column(1, 1, 16, format1)
+worksheet3.set_column(2, 2, 14, format1)
+worksheet3.set_column(3, 3, 14, format1)
+worksheet3.set_column(4, 4, 14, format1)
+worksheet3.set_column(5, 5, 14, format1)
+
+worksheet4.set_column(0, 0, 10)
+worksheet4.set_column(1, 1, 10, format1)
+worksheet4.set_column(2, 2, 10, format1)
+worksheet4.set_column(3, 3, 10, format1)
+worksheet4.set_column(4, 4, 16, format1)
+worksheet4.set_column(5, 5, 15, format1)
+worksheet4.set_column(6, 6, 15, format1)
+worksheet4.set_column(7, 7, 11, format1)
+worksheet4.set_column(8, 8, 16, format1)
+worksheet4.set_column(9, 9, 18, format1)
+worksheet4.set_column(10, 10, 14, format1)
+
+worksheet5.set_column(0, 0, 10)
+worksheet5.set_column(1, 1, 22, format1)
+worksheet5.set_column(2, 2, 18, format1)
+worksheet5.set_column(3, 3, 14, format1)
+worksheet5.set_column(4, 4, 14, format1)
+worksheet5.set_column(5, 5, 16, format1)
+worksheet5.set_column(6, 6, 13, format1)
+worksheet5.set_column(7, 7, 14, format1)
+
+worksheet6.set_column(0, 0, 10)
+worksheet6.set_column(1, 1, 17, format1)
+worksheet6.set_column(2, 2, 14, format1)
+worksheet6.set_column(3, 3, 14, format1)
+worksheet6.set_column(4, 4, 15, format1)
+worksheet6.set_column(5, 5, 18, format1)
+
+worksheet7.set_column(0, 0, 12)
+worksheet7.set_column(1, 1, 16, format1)
+worksheet7.set_column(2, 2, 10, format1)
+worksheet7.set_column(3, 3, 17, format1)
+worksheet7.set_column(4, 4, 14, format1)
+
+worksheet8.set_column(0, 0, 10)
+worksheet8.set_column(1, 1, 6, format1)
+worksheet8.set_column(2, 2, 11, format1)
+worksheet8.set_column(3, 3, 9, format1)
+worksheet8.set_column(4, 4, 9, format1)
+worksheet8.set_column(5, 5, 9, format1)
+worksheet8.set_column(6, 6, 16, format1)
+worksheet8.set_column(7, 7, 11, format1)
+worksheet8.set_column(8, 8, 9, format1)
+worksheet8.set_column(9, 9, 16, format1)
+worksheet8.set_column(10, 10, 18, format1)
+worksheet8.set_column(11, 11, 15, format1)
+worksheet8.set_column(12, 12, 15, format1)
+
+worksheet9.set_column(0, 0, 14)
+worksheet9.set_column(1, 1, 15, format1)
+worksheet9.set_column(2, 2, 11, format1)
+worksheet9.set_column(3, 3, 10, format1)
+worksheet9.set_column(4, 4, 17, format1)
+
+# Close the Pandas Excel writer and output the Excel file.
+writer.close()
